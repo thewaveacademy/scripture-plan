@@ -9,8 +9,9 @@ export default function Home() {
   const [matchedThemeIds, setMatchedThemeIds] = useState([])
   const [passages, setPassages] = useState([])
 
-  const [mode, setMode] = useState('situation') // 'situation' | 'manual'
+  const [mode, setMode] = useState('situation') // 'situation' | 'theology'
   const [situationText, setSituationText] = useState('')
+  const [theologyText, setTheologyText] = useState('')
 
   const [loadingThemes, setLoadingThemes] = useState(true)
   const [loadingPassages, setLoadingPassages] = useState(false)
@@ -28,11 +29,19 @@ export default function Home() {
     'I feel lonely',
   ]
 
+  const quickTheology = [
+    'What does the Bible say about salvation?',
+    'What does the Bible teach about faith?',
+    'What does scripture say about baptism?',
+    'What does the Bible say about forgiveness?',
+    'What does the Bible teach about grace?',
+    'What does the Bible say about suffering?',
+  ]
+
   function themeDisplayName(t) {
     return t?.name ?? t?.label ?? t?.title ?? `Theme ${t?.id ?? ''}`
   }
 
-  // Load themes for dropdown + LLM choices
   useEffect(() => {
     async function loadThemes() {
       setLoadingThemes(true)
@@ -62,7 +71,6 @@ export default function Home() {
     return themes.find((t) => String(t.id) === String(selectedThemeId))
   }, [themes, selectedThemeId])
 
-  // --------- LLM → Theme(s) ----------
   async function llmPickThemes(input) {
     const themeList = themes.map((t) => ({
       id: t.id,
@@ -82,7 +90,6 @@ export default function Home() {
     return ids.map((x) => String(x)).slice(0, 3)
   }
 
-  // --------- Embedding Search (server route) ----------
   async function semanticSearch(themeId, input, matchCount = 10) {
     const res = await fetch('/api/search', {
       method: 'POST',
@@ -97,12 +104,27 @@ export default function Home() {
     const json = await res.json()
     if (!res.ok) throw new Error(json?.error ?? 'Semantic search failed')
 
-    // route returns { results: [...] } OR { passages: [...] }
     const rows = json.results ?? json.passages ?? []
     return Array.isArray(rows) ? rows : []
   }
 
-  // --------- Situation Mode ----------
+  async function theologySearch(input, matchCount = 10) {
+    const res = await fetch('/api/theology', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input,
+        match_count: matchCount,
+      }),
+    })
+
+    const json = await res.json()
+    if (!res.ok) throw new Error(json?.error ?? 'Theology search failed')
+
+    const rows = json.results ?? json.passages ?? []
+    return Array.isArray(rows) ? rows : []
+  }
+
   async function runSituationSearch() {
     try {
       setLoadingPassages(true)
@@ -140,6 +162,32 @@ export default function Home() {
     }
   }
 
+  async function runTheologySearch() {
+    try {
+      setLoadingPassages(true)
+      setError(null)
+      setStatus('Searching theology passages…')
+      setPassages([])
+      setMatchedThemeIds([])
+
+      if (!theologyText.trim()) {
+        setStatus('Type a theology question first.')
+        return
+      }
+
+      const results = await theologySearch(theologyText, 10)
+      setPassages(results)
+
+      setStatus(`Loaded ${results.length} passages`)
+    } catch (e) {
+      setError({ message: e?.message ?? String(e) })
+      setPassages([])
+      setStatus('ERROR')
+    } finally {
+      setLoadingPassages(false)
+    }
+  }
+
   function resetSituation() {
     setSituationText('')
     setMatchedThemeIds([])
@@ -148,38 +196,14 @@ export default function Home() {
     setError(null)
   }
 
-  // --------- Manual Mode ----------
-  useEffect(() => {
-    if (mode !== 'manual') return
-    if (!selectedThemeId) return
+  function resetTheology() {
+    setTheologyText('')
+    setMatchedThemeIds([])
+    setPassages([])
+    setStatus('')
+    setError(null)
+  }
 
-    async function run() {
-      try {
-        setLoadingPassages(true)
-        setError(null)
-        setStatus('Searching passages for selected theme…')
-        setMatchedThemeIds([])
-
-        // Default query so vector search can rank within the theme.
-        const q = themeDisplayName(selectedTheme ?? { id: selectedThemeId })
-
-        const results = await semanticSearch(selectedThemeId, q, 10)
-        setPassages(results)
-        setStatus(`Loaded ${results.length} passages`)
-      } catch (e) {
-        setError({ message: e?.message ?? String(e) })
-        setPassages([])
-        setStatus('ERROR')
-      } finally {
-        setLoadingPassages(false)
-      }
-    }
-
-    run()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedThemeId, mode])
-
-  // --------- Export / Share ----------
   function buildShareText() {
     const dt = new Date().toLocaleString()
 
@@ -193,18 +217,17 @@ export default function Home() {
         : ''
 
     const header = [
-      'Super Bible Tool — Scripture Guidance',
+      'Bible Tool — Scripture Guidance',
       `Generated: ${dt}`,
       mode === 'situation'
-        ? `Input: ${situationText || ''}`
-        : `Theme: ${themeDisplayName(selectedTheme ?? { id: selectedThemeId })}`,
+        ? `Situation input: ${situationText || ''}`
+        : `Theology question: ${theologyText || ''}`,
       themeNames ? `Matched themes: ${themeNames}` : '',
       '',
     ]
       .filter(Boolean)
       .join('\n')
 
-    // Supports optional arc fields if present (arc_label, step_label)
     const body = (passages ?? [])
       .map((p) => {
         const lines = []
@@ -275,8 +298,6 @@ export default function Home() {
     }
   }
 
-  // Creates a share link by calling /api/share
-  // Expect response: { share_id: "abc123" } or { id: "abc123" }
   async function copyShareLink() {
     try {
       setShareBusy(true)
@@ -285,10 +306,9 @@ export default function Home() {
 
       const payload = {
         mode,
-        input: situationText || null,
+        input: mode === 'situation' ? situationText || null : theologyText || null,
         matched_theme_ids: matchedThemeIds?.map((x) => String(x)) ?? [],
-        theme_id: mode === 'manual' ? String(selectedThemeId || '') : null,
-        // Keep the stored payload small + stable
+        theme_id: null,
         passages: (passages ?? []).map((p) => ({
           ref: p.ref ?? null,
           ref_key: p.ref_key ?? null,
@@ -313,7 +333,6 @@ export default function Home() {
 
       const link = `${window.location.origin}/share/${shareId}`
 
-      // Clipboard may fail on insecure context; fallback to prompt
       try {
         await navigator.clipboard.writeText(link)
         setStatus('Share link copied ✅')
@@ -333,7 +352,6 @@ export default function Home() {
     <main style={{ padding: 24, fontFamily: 'system-ui' }}>
       <h1>Bible Tool</h1>
 
-      {/* Mode toggle */}
       <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
         <button
           onClick={() => setMode('situation')}
@@ -344,28 +362,27 @@ export default function Home() {
             fontWeight: mode === 'situation' ? 800 : 500,
           }}
         >
-          Situation Mode (LLM + Semantic Search)
+          Situation Mode
         </button>
 
         <button
-          onClick={() => setMode('manual')}
+          onClick={() => setMode('theology')}
           style={{
             padding: '8px 12px',
             borderRadius: 10,
             border: '1px solid #ddd',
-            fontWeight: mode === 'manual' ? 800 : 500,
+            fontWeight: mode === 'theology' ? 800 : 500,
           }}
         >
-          Manual Theme Mode (Semantic Search)
+          Theology Mode
         </button>
       </div>
 
-      {/* Situation Mode */}
       {mode === 'situation' && (
         <section style={{ marginTop: 16 }}>
           <h2 style={{ margin: 0 }}>Describe what you’re facing</h2>
           <p style={{ marginTop: 6, opacity: 0.8 }}>
-            We map your input to a theme, then return the most relevant passages (links only).
+            We map your input to a theme, then return the most relevant passages.
           </p>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
@@ -418,40 +435,52 @@ export default function Home() {
         </section>
       )}
 
-      {/* Manual Mode */}
-      {mode === 'manual' && (
+      {mode === 'theology' && (
         <section style={{ marginTop: 16 }}>
-          <h2 style={{ margin: 0 }}>Browse by theme</h2>
+          <h2 style={{ margin: 0 }}>Ask a theology question</h2>
+          <p style={{ marginTop: 6, opacity: 0.8 }}>
+            Ask a doctrinal or Bible teaching question and get relevant passages.
+          </p>
 
-          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
-            <label style={{ fontWeight: 700 }}>Theme</label>
+          <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
+            <input
+              value={theologyText}
+              onChange={(e) => setTheologyText(e.target.value)}
+              placeholder="Example: What does the Bible say about salvation?"
+              style={{ padding: 10, borderRadius: 10, border: '1px solid #ddd', minWidth: 320 }}
+            />
 
-            {loadingThemes ? (
-              <span>Loading themes…</span>
-            ) : (
-              <select
-                value={selectedThemeId}
-                onChange={(e) => setSelectedThemeId(e.target.value)}
-                style={{ padding: 8, borderRadius: 8 }}
+            <button
+              onClick={runTheologySearch}
+              disabled={loadingPassages || !theologyText.trim()}
+              style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
+            >
+              {loadingPassages ? 'Loading…' : 'Get theology passages'}
+            </button>
+
+            <button
+              onClick={resetTheology}
+              disabled={loadingPassages}
+              style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
+            >
+              Reset
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            {quickTheology.map((q) => (
+              <button
+                key={q}
+                onClick={() => setTheologyText(q)}
+                style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd' }}
               >
-                {themes.map((t) => (
-                  <option key={t.id} value={String(t.id)}>
-                    {themeDisplayName(t)}
-                  </option>
-                ))}
-              </select>
-            )}
-
-            {selectedTheme && (
-              <span style={{ opacity: 0.75 }}>
-                Showing: <b>{themeDisplayName(selectedTheme)}</b>
-              </span>
-            )}
+                {q}
+              </button>
+            ))}
           </div>
         </section>
       )}
 
-      {/* Status + Errors */}
       {status && (
         <p style={{ marginTop: 16 }}>
           <b>Status:</b> {status}
@@ -464,7 +493,6 @@ export default function Home() {
         </pre>
       )}
 
-      {/* Export / Share */}
       {passages.length > 0 && (
         <section style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
           <button
@@ -498,12 +526,11 @@ export default function Home() {
           </button>
 
           <span style={{ opacity: 0.7, alignSelf: 'center' }}>
-            Exports your input + selected passages (links only).
+            Exports your input + selected passages.
           </span>
         </section>
       )}
 
-      {/* Results */}
       <div style={{ display: 'grid', gap: 12, marginTop: 16 }}>
         {passages.map((p) => (
           <div key={p.id ?? `${p.ref}-${p.esv_url}`} style={{ border: '1px solid #ddd', borderRadius: 12, padding: 16 }}>

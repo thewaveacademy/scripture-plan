@@ -193,7 +193,7 @@ export default function Home() {
         : ''
 
     const header = [
-      'Bible Tool — Scripture Guidance',
+      'Super Bible Tool — Scripture Guidance',
       `Generated: ${dt}`,
       mode === 'situation'
         ? `Input: ${situationText || ''}`

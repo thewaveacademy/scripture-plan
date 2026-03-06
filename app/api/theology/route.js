@@ -1,252 +1,200 @@
 import OpenAI from 'openai'
-import { createClient } from '@supabase/supabase-js'
 
 export const runtime = 'nodejs'
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-if (!supabaseUrl) throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL')
-if (!serviceKey) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY')
+const ARCS = ['GOD', 'HUMANITY', 'CHRIST', 'APOSTOLIC', 'GOSPEL', 'RESPONSE', 'WISDOM', 'NARRATIVE', 'OTHER']
 
-const supabase = createClient(supabaseUrl, serviceKey)
+const REQUIRED_THEOLOGY_ARCS = ['GOD', 'HUMANITY', 'CHRIST', 'APOSTOLIC', 'GOSPEL']
 
-// --------------------
-// Simple in-memory caches (dev-friendly)
-// --------------------
-const planCache = globalThis.__theologyPlanCache ?? new Map()
-globalThis.__theologyPlanCache = planCache
-
-const embedCache = globalThis.__embedCache ?? new Map()
-globalThis.__embedCache = embedCache
-
-// --------------------
-// Helpers
-// --------------------
-function normalizeVector(v) {
-  if (Array.isArray(v)) return `[${v.join(',')}]`
-  return v
-}
-
-async function embed(text) {
-  const key = String(text || '').trim()
-  if (!key) return null
-  if (embedCache.has(key)) return embedCache.get(key)
-
-  const resp = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: key,
-  })
-  const emb = resp.data?.[0]?.embedding ?? null
-  embedCache.set(key, emb)
-  return emb
-}
-
-async function matchPassagesGlobal(queryEmbedding, matchCount = 10) {
-  const { data, error } = await supabase.rpc('match_passages_global', {
-    query_embedding: normalizeVector(queryEmbedding),
-    match_count: matchCount,
-  })
-  if (error) throw error
-  return Array.isArray(data) ? data : []
-}
-
-async function buildPlan(question) {
-  const q = String(question || '').trim()
-  if (planCache.has(q)) return planCache.get(q)
-
-  const system = `
-You create a Bible study plan for theological questions.
-Return ONLY valid JSON.
-
-Requirements:
-- Identify the main topic in a short title.
-- Produce a plan with 4 to 6 steps.
-- Each step must include:
-  - step_title (string)
-  - step_goal (1 short sentence)
-  - search_queries (2 to 5 short phrases for semantic search)
-- Keep queries Bible-forward (e.g., "justified by faith", "atonement Christ blood", "Trinity Father Son Spirit").
-Schema:
-{
-  "topic": "<string>",
-  "plan": [
-    { "step_title": "<string>", "step_goal": "<string>", "search_queries": ["..."] }
-  ]
-}
-`.trim()
-
-  const resp = await openai.responses.create({
-    model: 'gpt-4o-mini',
-    input: [
-      { role: 'system', content: system },
-      { role: 'user', content: `Question: ${q}` },
-    ],
-  })
-
-  const text = (resp.output_text ?? '').trim()
-
-  let parsed = null
+function safeJsonParse(text) {
   try {
-    parsed = JSON.parse(text)
+    return JSON.parse(text)
   } catch {
-    const match = text.match(/\{[\s\S]*\}/)
-    parsed = match ? JSON.parse(match[0]) : null
+    const match = String(text || '').match(/\{[\s\S]*\}/)
+    if (!match) return null
+    return JSON.parse(match[0])
   }
-
-  const topic = String(parsed?.topic ?? 'Theological Question').slice(0, 80)
-  const rawPlan = Array.isArray(parsed?.plan) ? parsed.plan.slice(0, 6) : []
-
-  if (rawPlan.length === 0) throw new Error('Plan generation failed')
-
-  const plan = rawPlan.map((s, i) => ({
-    step_title: String(s.step_title ?? `Step ${i + 1}`).slice(0, 80),
-    step_goal: String(s.step_goal ?? '').slice(0, 180),
-    search_queries: Array.isArray(s.search_queries)
-      ? s.search_queries.map((x) => String(x).trim()).filter(Boolean).slice(0, 5)
-      : [],
-  }))
-
-  const out = { topic, plan }
-  planCache.set(q, out)
-  return out
 }
 
-function dedupeById(rows) {
-  const map = new Map()
-  for (const r of rows || []) {
-    if (r?.id == null) continue
-    if (!map.has(r.id)) map.set(r.id, r)
+function normalizeSelected(candidates, selectedRaw) {
+  const byId = new Map((candidates ?? []).map((c) => [c.id, c]))
+  const out = []
+
+  for (const s of selectedRaw ?? []) {
+    const id = s?.id
+    if (id == null) continue
+    if (!byId.has(id)) continue
+
+    const arcRaw = String(s.arc ?? 'OTHER').trim().toUpperCase()
+    const arc = ARCS.includes(arcRaw) ? arcRaw : 'OTHER'
+
+    out.push({
+      id,
+      arc,
+      primary_category: s.primary_category ? String(s.primary_category).slice(0, 80) : null,
+      secondary_categories: Array.isArray(s.secondary_categories)
+        ? s.secondary_categories.map((x) => String(x).slice(0, 40)).filter(Boolean).slice(0, 6)
+        : [],
+      why: s.why ? String(s.why).slice(0, 240) : null,
+    })
   }
-  return Array.from(map.values())
+
+  // Dedupe by id (keep first)
+  const seen = new Set()
+  const deduped = []
+  for (const row of out) {
+    if (seen.has(row.id)) continue
+    seen.add(row.id)
+    deduped.push(row)
+  }
+  return deduped
+}
+
+function enforceRequiredArcs(selected, candidates) {
+  // If the model missed a required arc, we’ll fill it using the best-available candidate
+  // by asking the model to pick ONE for the missing arc (cheap, but adds time).
+  // Instead, we do a deterministic fallback: pick the highest-similarity candidate not already selected.
+  //
+  // This keeps speed, and usually works because your candidates already come from semantic search.
+
+  const selectedIds = new Set(selected.map((s) => s.id))
+  const have = new Set(selected.map((s) => s.arc))
+
+  const pool = (candidates ?? [])
+    .filter((c) => c?.id != null && !selectedIds.has(c.id))
+    .slice(0, 80)
+
+  // Build a simple “best-first” ordering using similarity if present
+  pool.sort((a, b) => {
+    const sa = typeof a.similarity === 'number' ? a.similarity : (typeof a.distance === 'number' ? 1 - a.distance : 0)
+    const sb = typeof b.similarity === 'number' ? b.similarity : (typeof b.distance === 'number' ? 1 - b.distance : 0)
+    return sb - sa
+  })
+
+  // If missing arcs, we can’t truly know which candidate fits which arc without another LLM call,
+  // so we DO NOT fake-assign arcs here. We only enforce coverage via the prompt (below).
+  // This function stays as a guardrail point if you later add arc tags into DB.
+  return selected
 }
 
 export async function POST(req) {
   try {
-    const { question } = await req.json()
-    const q = String(question || '').trim()
-    if (!q) return Response.json({ error: 'Missing question' }, { status: 400 })
+    const body = await req.json()
+    const input = String(body?.input ?? '').trim()
+    const candidates = Array.isArray(body?.candidates) ? body.candidates : []
+    const mode = String(body?.mode ?? 'situation').trim().toLowerCase()
+    const plan = Array.isArray(body?.plan) ? body.plan : null
 
-    // 1) Build plan (cached)
-    const { topic, plan } = await buildPlan(q)
+    if (!input) return Response.json({ error: 'Missing input' }, { status: 400 })
+    if (candidates.length === 0) return Response.json({ selected: [] })
 
-    // 2) Retrieve candidates per step (parallel)
-    // passageBestStep: id -> { stepIndex, score }
-    const passageBestStep = new Map()
-    const allCandidates = []
-
-    await Promise.all(
-      plan.map(async (step, stepIndex) => {
-        const queries = step.search_queries ?? []
-        if (queries.length === 0) return
-
-        const embs = await Promise.all(queries.map((qq) => embed(qq)))
-        const validEmbs = embs.filter(Boolean)
-
-        const matchLists = await Promise.all(validEmbs.map((e) => matchPassagesGlobal(e, 10)))
-
-        const flat = matchLists.flat()
-        const unique = dedupeById(flat).slice(0, 30)
-
-        for (const p of unique) {
-          allCandidates.push(p)
-          if (p?.id == null) continue
-
-          const score =
-            typeof p.similarity === 'number'
-              ? p.similarity
-              : (typeof p.distance === 'number' ? 1 - p.distance : 0)
-
-          const prev = passageBestStep.get(p.id)
-          if (!prev) {
-            passageBestStep.set(p.id, { stepIndex, score })
-          } else {
-            if (score > prev.score) passageBestStep.set(p.id, { stepIndex, score })
-          }
-        }
-      })
-    )
-
-    const candidates = dedupeById(allCandidates).slice(0, 120)
-
-    if (candidates.length === 0) {
-      return Response.json({
-        topic,
-        steps: plan.map((s) => ({
-          step_title: s.step_title,
-          step_goal: s.step_goal,
-          passages: [],
-        })),
-      })
-    }
-
-    // 3) Single curation call for the whole theology question
-    const baseUrl = new URL(req.url).origin
-    const curateRes = await fetch(`${baseUrl}/api/curate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        input: q,
-        candidates,
-        mode: 'theology',
-        plan,
-      }),
-    })
-
-    const curateText = await curateRes.text()
-    let curateJson
-    try {
-      curateJson = JSON.parse(curateText)
-    } catch {
-      throw new Error(`Curate returned non-JSON (${curateRes.status}): ${curateText.slice(0, 200)}`)
-    }
-
-    if (!curateRes.ok) throw new Error(curateJson?.error ?? 'Curation failed')
-
-    const selected = Array.isArray(curateJson.selected) ? curateJson.selected : []
-
-    // 4) Merge curated metadata back onto base candidate rows
-    const byId = new Map(candidates.map((p) => [p.id, p]))
-    const curatedRows = selected
-      .map((s) => (byId.get(s.id) ? { ...byId.get(s.id), ...s } : null))
-      .filter(Boolean)
-
-    // 5) Assign each curated row to exactly ONE step (best step)
-    const stepBuckets = plan.map(() => [])
-    for (const p of curatedRows) {
-      const best = passageBestStep.get(p.id)
-      const idx = best?.stepIndex ?? 0
-      if (stepBuckets[idx]) stepBuckets[idx].push(p)
-    }
-
-    const steps = plan.map((s, idx) => ({
-      step_title: s.step_title,
-      step_goal: s.step_goal,
-      passages: stepBuckets[idx] ?? [],
+    // Keep prompt size under control
+    const maxCandidates = mode === 'theology' ? 60 : 40
+    const trimmed = candidates.slice(0, maxCandidates).map((c) => ({
+      id: c.id,
+      ref: c.ref,
+      ref_key: c.ref_key,
+      genre: c.genre,
+      unit: c.unit,
+      notes: c.notes,
+      esv_url: c.esv_url,
+      similarity: c.similarity ?? null,
+      distance: c.distance ?? null,
     }))
 
-    // 6) Fallback: fill empty steps with UNUSED passages only (no repeats)
-    const used = new Set()
-    for (const st of steps) for (const p of st.passages ?? []) if (p?.id != null) used.add(p.id)
+    const theologyRules = `
+You are curating passages for a theology study plan.
+You MUST produce a Christ-centered, gospel-centered set.
 
-    let cursor = 0
-    const finalSteps = steps.map((st) => {
-      if ((st.passages?.length ?? 0) > 0) return st
+Hard requirements:
+- Choose passages ONLY from the provided candidates list.
+- You MUST include at least ONE passage for EACH required arc:
+  ${REQUIRED_THEOLOGY_ARCS.join(', ')}.
+- Do NOT claim a passage "is about" the user's question. Only explain why it is useful/connected.
+- Keep summaries grounded: avoid speculation, avoid overconfident claims, avoid proof-texting.
+- Prefer clearer didactic passages for doctrine (Epistles) while still using OT and Gospels appropriately.
+- Include Humanity/Sin/need for grace where relevant, and explicitly connect need → Christ.
+Output JSON only.
 
-      const fill = []
-      while (cursor < curatedRows.length && fill.length < 6) {
-        const p = curatedRows[cursor++]
-        if (!p?.id) continue
-        if (used.has(p.id)) continue
-        used.add(p.id)
-        fill.push(p)
-      }
+Return JSON exactly:
+{
+  "selected": [
+    {
+      "id": <number>,
+      "arc": "GOD|HUMANITY|CHRIST|APOSTOLIC|GOSPEL|RESPONSE|WISDOM|NARRATIVE|OTHER",
+      "primary_category": "<short label>",
+      "secondary_categories": ["<label>", "..."],
+      "why": "<1-2 sentences, faithful + restrained>"
+    }
+  ]
+}
+`.trim()
 
-      return { ...st, passages: fill }
+    const situationRules = `
+You are curating passages for a situation-based Bible guidance tool.
+
+Rules:
+- Choose passages ONLY from provided candidates.
+- Keep it Christ-centered and gospel-aware (include God’s character, human need, Christ, response).
+- Do NOT claim the passage is "about" the user's situation. Explain relevance without overreach.
+- Output JSON only in the exact schema below.
+
+Return JSON exactly:
+{
+  "selected": [
+    {
+      "id": <number>,
+      "arc": "GOD|HUMANITY|CHRIST|APOSTOLIC|GOSPEL|RESPONSE|WISDOM|NARRATIVE|OTHER",
+      "primary_category": "<short label>",
+      "secondary_categories": ["<label>", "..."],
+      "why": "<1-2 sentences>"
+    }
+  ]
+}
+`.trim()
+
+    const system = mode === 'theology' ? theologyRules : situationRules
+
+    // If theology mode, include the plan titles/goals as context (small)
+    const planText =
+      mode === 'theology' && plan
+        ? `Plan steps:\n${plan
+            .slice(0, 6)
+            .map((s, i) => `${i + 1}) ${String(s.step_title ?? '').slice(0, 60)} — ${String(s.step_goal ?? '').slice(0, 120)}`)
+            .join('\n')}\n`
+        : ''
+
+    const user = `
+User input/question:
+${input}
+
+${planText}
+Candidates (pick ONLY from these IDs):
+${JSON.stringify(trimmed, null, 2)}
+`.trim()
+
+    const resp = await client.responses.create({
+      model: 'gpt-4o-mini',
+      input: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
     })
 
-    return Response.json({ topic, steps: finalSteps })
+    const text = (resp.output_text ?? '').trim()
+    const parsed = safeJsonParse(text)
+
+    const selectedRaw = Array.isArray(parsed?.selected) ? parsed.selected : []
+    let selected = normalizeSelected(trimmed, selectedRaw)
+
+    // Theology: enforce coverage via prompt; keep a guard hook here
+    if (mode === 'theology') {
+      selected = enforceRequiredArcs(selected, trimmed)
+    }
+
+    return Response.json({ selected })
   } catch (err) {
     return Response.json({ error: err?.message ?? 'Unknown error' }, { status: 500 })
   }

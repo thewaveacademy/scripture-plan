@@ -18,11 +18,15 @@ async function embedText(input) {
     input,
   })
 
-  return resp.data[0].embedding
+  return resp.data?.[0]?.embedding
 }
 
 async function semanticSearch(input, matchCount = 20) {
   const embedding = await embedText(input)
+
+  if (!embedding) {
+    throw new Error('Failed to generate embedding')
+  }
 
   const { data, error } = await supabase.rpc('match_passages', {
     query_embedding: embedding,
@@ -36,6 +40,36 @@ async function semanticSearch(input, matchCount = 20) {
   return Array.isArray(data) ? data : []
 }
 
+function extractJsonObject(text) {
+  const match = text.match(/\{[\s\S]*\}/)
+  return match ? match[0] : null
+}
+
+function cleanJsonText(text) {
+  let cleaned = text.trim()
+
+  cleaned = cleaned.replace(/```json\s*/gi, '').replace(/```/g, '').trim()
+
+  cleaned = cleaned.replace(
+    /"desired_arc"\s*:\s*(GOD|HUMANITY|CHRIST|GOSPEL|RESPONSE|WISDOM|NARRATIVE|null)/g,
+    (_, val) => `"desired_arc": ${val === 'null' ? 'null' : `"${val}"`}`
+  )
+
+  return cleaned
+}
+
+function parseLooseJson(text) {
+  try {
+    return JSON.parse(text)
+  } catch {
+    const extracted = extractJsonObject(text)
+    if (!extracted) return null
+
+    const cleaned = cleanJsonText(extracted)
+    return JSON.parse(cleaned)
+  }
+}
+
 async function curatePassages(input, candidates, extra = {}) {
   const system = `
 You curate Bible passages for a theology study step.
@@ -46,12 +80,15 @@ Rules:
 - Prefer passages that directly answer the step goal.
 - Preserve a Christ-centered biblical arc when possible.
 - Use arc values only from: ${ARC.join(', ')}.
-- Add:
-  - id
-  - arc
-  - primary_category
-  - secondary_categories
-  - why
+- All string values must use double quotes.
+- desired_arc must always be either a JSON string or null.
+
+Add these fields for each selected passage:
+- id
+- arc
+- primary_category
+- secondary_categories
+- why
 
 Schema:
 {
@@ -78,6 +115,7 @@ Schema:
       genre: c.genre ?? null,
       unit: c.unit ?? null,
       similarity: c.similarity ?? null,
+      distance: c.distance ?? null,
     })),
   })
 
@@ -90,14 +128,7 @@ Schema:
   })
 
   const text = (resp.output_text ?? '').trim()
-
-  let parsed = null
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/)
-    parsed = match ? JSON.parse(match[0]) : null
-  }
+  const parsed = parseLooseJson(text)
 
   const selected = Array.isArray(parsed?.selected) ? parsed.selected : []
   return selected
@@ -122,9 +153,13 @@ Requirements:
   - step_title (string)
   - step_goal (1 short sentence)
   - search_queries (2 to 5 short phrases for semantic search)
-  - desired_arc (one of: ${ARC.join(', ')}) OR null if not applicable
+  - desired_arc must be a JSON string using one of these exact values:
+    "GOD", "HUMANITY", "CHRIST", "GOSPEL", "RESPONSE", "WISDOM", "NARRATIVE"
+    or null
 - Keep queries general and Bible-forward.
 - Do not include commentary, only the plan.
+- All string values must be wrapped in double quotes.
+- Return strict valid JSON only.
 
 Schema:
 {
@@ -151,17 +186,13 @@ Schema:
     })
 
     const text = (resp.output_text ?? '').trim()
-
-    let parsed = null
-    try {
-      parsed = JSON.parse(text)
-    } catch {
-      const match = text.match(/\{[\s\S]*\}/)
-      parsed = match ? JSON.parse(match[0]) : null
-    }
+    const parsed = parseLooseJson(text)
 
     if (!parsed?.plan || !Array.isArray(parsed.plan)) {
-      return Response.json({ error: 'Invalid plan output', raw: text }, { status: 500 })
+      return Response.json(
+        { error: 'Invalid plan output', raw: text },
+        { status: 500 }
+      )
     }
 
     const plan = parsed.plan.slice(0, 6).map((s) => ({
@@ -183,7 +214,7 @@ Schema:
           ? step.search_queries.join(' | ')
           : `${topic} ${step.step_title} ${step.step_goal}`
 
-     const candidates = await semanticSearch(queryText, 20)
+      const candidates = await semanticSearch(queryText, 20)
 
       const curated = await curatePassages(question, candidates, {
         mode: 'theology',
@@ -213,6 +244,9 @@ Schema:
 
     return Response.json({ topic, steps })
   } catch (err) {
-    return Response.json({ error: err?.message ?? 'Unknown error' }, { status: 500 })
+    return Response.json(
+      { error: err?.message ?? 'Unknown error' },
+      { status: 500 }
+    )
   }
 }

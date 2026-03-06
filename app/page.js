@@ -1,24 +1,24 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabaseClient'
 
 export default function Home() {
   const [themes, setThemes] = useState([])
-  const [selectedThemeId, setSelectedThemeId] = useState('')
   const [matchedThemeIds, setMatchedThemeIds] = useState([])
   const [passages, setPassages] = useState([])
-
   const [mode, setMode] = useState('situation') // 'situation' | 'theology'
+
   const [situationText, setSituationText] = useState('')
-  const [theologyText, setTheologyText] = useState('')
+
+  const [theologyQuestion, setTheologyQuestion] = useState('')
+  const [theologyTopic, setTheologyTopic] = useState('')
+  const [theologySteps, setTheologySteps] = useState([])
 
   const [loadingThemes, setLoadingThemes] = useState(true)
-  const [loadingPassages, setLoadingPassages] = useState(false)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [status, setStatus] = useState('')
-
-  const [shareBusy, setShareBusy] = useState(false)
 
   const quickSituations = [
     'I feel anxious about the future',
@@ -30,16 +30,30 @@ export default function Home() {
   ]
 
   const quickTheology = [
-    'What does the Bible say about salvation?',
-    'What does the Bible teach about faith?',
-    'What does scripture say about baptism?',
-    'What does the Bible say about forgiveness?',
-    'What does the Bible teach about grace?',
-    'What does the Bible say about suffering?',
+    'What is the gospel?',
+    'What is repentance?',
+    'What is justification?',
+    'What is sanctification?',
+    'What is the Trinity?',
+    'Can a Christian lose salvation?',
   ]
 
+  const ARC_LABELS = {
+    GOD: 'God',
+    HUMANITY: 'Humanity (sin / need)',
+    CHRIST: 'Christ',
+    APOSTOLIC: 'Apostolic Instruction',
+    GOSPEL: 'Gospel (redemption + hope)',
+    RESPONSE: 'Response (faith + obedience)',
+    WISDOM: 'Wisdom',
+    NARRATIVE: 'OT Narrative',
+    OTHER: 'Other',
+  }
+
+  const ARC_ORDER = ['GOD', 'HUMANITY', 'CHRIST', 'APOSTOLIC', 'GOSPEL', 'RESPONSE', 'WISDOM', 'NARRATIVE', 'OTHER']
+
   function themeDisplayName(t) {
-    return t?.name ?? t?.label ?? t?.title ?? `Theme ${t?.id ?? ''}`
+    return t.name ?? t.label ?? t.title ?? `Theme ${t.id}`
   }
 
   useEffect(() => {
@@ -53,27 +67,18 @@ export default function Home() {
         setError(res.error)
         setThemes([])
       } else {
-        const data = res.data ?? []
-        setThemes(data)
-        if (!selectedThemeId && data.length > 0) {
-          setSelectedThemeId(String(data[0].id))
-        }
+        setThemes(res.data ?? [])
       }
 
       setLoadingThemes(false)
     }
 
     loadThemes()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  const selectedTheme = useMemo(() => {
-    return themes.find((t) => String(t.id) === String(selectedThemeId))
-  }, [themes, selectedThemeId])
 
   async function llmPickThemes(input) {
     const themeList = themes.map((t) => ({
-      id: t.id,
+      id: String(t.id),
       name: themeDisplayName(t),
     }))
 
@@ -90,7 +95,7 @@ export default function Home() {
     return ids.map((x) => String(x)).slice(0, 3)
   }
 
-  async function semanticSearch(themeId, input, matchCount = 10) {
+  async function semanticSearch(themeId, input, matchCount = 25) {
     const res = await fetch('/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -108,26 +113,36 @@ export default function Home() {
     return Array.isArray(rows) ? rows : []
   }
 
-  async function theologySearch(input, matchCount = 10) {
-    const res = await fetch('/api/theology', {
+  async function curatePassages(input, candidates, extra = {}) {
+    const res = await fetch('/api/curate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        input,
-        match_count: matchCount,
-      }),
+      body: JSON.stringify({ input, candidates, ...extra }),
     })
 
     const json = await res.json()
-    if (!res.ok) throw new Error(json?.error ?? 'Theology search failed')
+    if (!res.ok) throw new Error(json?.error ?? 'Curation failed')
 
-    const rows = json.results ?? json.passages ?? []
-    return Array.isArray(rows) ? rows : []
+    const selected = Array.isArray(json.selected) ? json.selected : []
+    return selected
+  }
+
+  function groupByArc(rows) {
+    const grouped = (rows ?? []).reduce((acc, p) => {
+      const raw = p?.arc ? String(p.arc) : ''
+      const normalized = raw.trim().toUpperCase()
+      const key = ARC_ORDER.includes(normalized) ? normalized : 'OTHER'
+
+      if (!acc[key]) acc[key] = []
+      acc[key].push({ ...p, arc: key })
+      return acc
+    }, {})
+    return grouped
   }
 
   async function runSituationSearch() {
     try {
-      setLoadingPassages(true)
+      setLoading(true)
       setError(null)
       setStatus('Interpreting input…')
       setPassages([])
@@ -138,53 +153,46 @@ export default function Home() {
         return
       }
 
-      const ids = await llmPickThemes(situationText)
-      setMatchedThemeIds(ids)
+      if (themes.length === 0) {
+        setStatus('Themes not loaded yet.')
+        return
+      }
 
-      if (ids.length === 0) {
+      const ids = await llmPickThemes(situationText)
+      const validIds = ids.filter((id) => themes.some((t) => String(t.id) === String(id)))
+      setMatchedThemeIds(validIds)
+
+      const primaryThemeId = validIds[0]
+      if (!primaryThemeId) {
         setStatus('No matching themes found. Try different wording.')
         return
       }
 
-      const primaryThemeId = ids[0]
-      setStatus('Searching most relevant passages…')
+      setStatus('Searching candidates…')
+      const candidates = await semanticSearch(primaryThemeId, situationText, 25)
 
-      const results = await semanticSearch(primaryThemeId, situationText, 10)
-      setPassages(results)
+      setStatus('Curating…')
+      const curated = await curatePassages(situationText, candidates, { mode: 'situation' })
 
-      setStatus(`Loaded ${results.length} passages`)
+      const byId = new Map(candidates.map((p) => [p.id, p]))
+      const finalRows = curated
+        .map((c) => {
+          const base = byId.get(c.id)
+          if (!base) return null
+          return { ...base, ...c }
+        })
+        .filter(Boolean)
+
+      const rowsToShow = finalRows.length > 0 ? finalRows : candidates.slice(0, 10)
+
+      setPassages(rowsToShow)
+      setStatus(`Loaded ${rowsToShow.length} passages`)
     } catch (e) {
       setError({ message: e?.message ?? String(e) })
       setPassages([])
       setStatus('ERROR')
     } finally {
-      setLoadingPassages(false)
-    }
-  }
-
-  async function runTheologySearch() {
-    try {
-      setLoadingPassages(true)
-      setError(null)
-      setStatus('Searching theology passages…')
-      setPassages([])
-      setMatchedThemeIds([])
-
-      if (!theologyText.trim()) {
-        setStatus('Type a theology question first.')
-        return
-      }
-
-      const results = await theologySearch(theologyText, 10)
-      setPassages(results)
-
-      setStatus(`Loaded ${results.length} passages`)
-    } catch (e) {
-      setError({ message: e?.message ?? String(e) })
-      setPassages([])
-      setStatus('ERROR')
-    } finally {
-      setLoadingPassages(false)
+      setLoading(false)
     }
   }
 
@@ -196,156 +204,101 @@ export default function Home() {
     setError(null)
   }
 
+  async function runTheology() {
+    try {
+      setLoading(true)
+      setError(null)
+      setStatus('Generating theology plan…')
+      setTheologyTopic('')
+      setTheologySteps([])
+      setPassages([])
+
+      if (!theologyQuestion.trim()) {
+        setStatus('Type a question first.')
+        return
+      }
+
+      const res = await fetch('/api/theology', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: theologyQuestion }),
+      })
+
+      const text = await res.text()
+      let json
+      try {
+        json = JSON.parse(text)
+      } catch {
+        throw new Error(`Non-JSON response (${res.status}). First 200 chars: ${text.slice(0, 200)}`)
+      }
+
+      if (!res.ok) throw new Error(json?.error ?? 'Theology mode failed')
+
+      setTheologyTopic(json.topic ?? '')
+      setTheologySteps(Array.isArray(json.steps) ? json.steps : [])
+      setStatus(`Loaded plan: ${json.topic ?? 'Theology'}`)
+    } catch (e) {
+      setError({ message: e?.message ?? String(e) })
+      setStatus('ERROR')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   function resetTheology() {
-    setTheologyText('')
-    setMatchedThemeIds([])
-    setPassages([])
+    setTheologyQuestion('')
+    setTheologyTopic('')
+    setTheologySteps([])
     setStatus('')
     setError(null)
   }
 
-  function buildShareText() {
-    const dt = new Date().toLocaleString()
+  function PassageCard({ p }) {
+    return (
+      <div
+        key={p.id ?? `${p.ref}-${p.esv_url}`}
+        style={{ border: '1px solid #ddd', borderRadius: 12, padding: 16 }}
+      >
+        <div style={{ fontWeight: 800, fontSize: 16 }}>{p.ref}</div>
 
-    const themeNames =
-      matchedThemeIds?.length > 0
-        ? matchedThemeIds
-            .map((id) => themes.find((t) => String(t.id) === String(id)))
-            .filter(Boolean)
-            .map((t) => themeDisplayName(t))
-            .join(', ')
-        : ''
+        <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>
+          {(p.genre ?? '—')} • {(p.unit ?? '—')} • {(p.ref_key ?? '—')}
+          {typeof p.distance === 'number' ? ` • dist: ${p.distance.toFixed(3)}` : ''}
+          {typeof p.similarity === 'number' ? ` • sim: ${p.similarity.toFixed(3)}` : ''}
+        </div>
 
-    const header = [
-      'Bible Tool — Scripture Guidance',
-      `Generated: ${dt}`,
-      mode === 'situation'
-        ? `Situation input: ${situationText || ''}`
-        : `Theology question: ${theologyText || ''}`,
-      themeNames ? `Matched themes: ${themeNames}` : '',
-      '',
-    ]
-      .filter(Boolean)
-      .join('\n')
+        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.9 }}>
+          <b>Arc:</b> {ARC_LABELS[p.arc] ?? p.arc ?? 'Other'}
+        </div>
 
-    const body = (passages ?? [])
-      .map((p) => {
-        const lines = []
-        lines.push(`• ${p.ref ?? '(no ref)'}`)
+        {p.primary_category ? (
+          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.9 }}>
+            <b>{p.primary_category}</b>
+            {Array.isArray(p.secondary_categories) && p.secondary_categories.length > 0
+              ? ` • ${p.secondary_categories.join(', ')}`
+              : ''}
+          </div>
+        ) : null}
 
-        const arc = p.arc_label ?? p.arc ?? p.role ?? null
-        const step = p.step_label ?? p.step ?? null
+        {p.why ? <div style={{ marginTop: 8, fontSize: 13, opacity: 0.9 }}>{p.why}</div> : null}
 
-        if (arc) lines.push(`  - Arc: ${arc}`)
-        if (step) lines.push(`  - Step: ${step}`)
-        if (p.esv_url) lines.push(`  - Link: ${p.esv_url}`)
-        if (p.notes) lines.push(`  - Notes: ${p.notes}`)
-        return lines.join('\n')
-      })
-      .join('\n\n')
+        <div style={{ marginTop: 10 }}>
+          {p.esv_url ? (
+            <a href={p.esv_url} target="_blank" rel="noreferrer" style={{ textDecoration: 'underline' }}>
+              Open in ESV
+            </a>
+          ) : (
+            <em>(No ESV link)</em>
+          )}
+        </div>
 
-    return `${header}\n${body}\n`
-  }
-
-  async function copyToClipboard() {
-    try {
-      const text = buildShareText()
-      await navigator.clipboard.writeText(text)
-      setStatus('Copied to clipboard ✅')
-    } catch (e) {
-      setError({ message: e?.message ?? String(e) })
-      setStatus('Copy failed ❌')
-    }
-  }
-
-  function downloadTxt() {
-    try {
-      const text = buildShareText()
-      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `bible-tool-${new Date().toISOString().slice(0, 10)}.txt`
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(url)
-      setStatus('Downloaded .txt ✅')
-    } catch (e) {
-      setError({ message: e?.message ?? String(e) })
-      setStatus('Download failed ❌')
-    }
-  }
-
-  async function shareNative() {
-    try {
-      const text = buildShareText()
-      if (!navigator.share) {
-        setStatus('Native share not supported on this device.')
-        return
-      }
-      await navigator.share({
-        title: 'Bible Tool — Scripture Guidance',
-        text,
-      })
-      setStatus('Shared ✅')
-    } catch (e) {
-      const msg = e?.message ?? String(e)
-      if (!/abort|cancel/i.test(msg)) {
-        setError({ message: msg })
-        setStatus('Share failed ❌')
-      }
-    }
-  }
-
-  async function copyShareLink() {
-    try {
-      setShareBusy(true)
-      setError(null)
-      setStatus('Creating share link…')
-
-      const payload = {
-        mode,
-        input: mode === 'situation' ? situationText || null : theologyText || null,
-        matched_theme_ids: matchedThemeIds?.map((x) => String(x)) ?? [],
-        theme_id: null,
-        passages: (passages ?? []).map((p) => ({
-          ref: p.ref ?? null,
-          ref_key: p.ref_key ?? null,
-          esv_url: p.esv_url ?? null,
-          arc_label: p.arc_label ?? p.arc ?? p.role ?? null,
-          step_label: p.step_label ?? p.step ?? null,
-          similarity: typeof p.similarity === 'number' ? p.similarity : null,
-        })),
-      }
-
-      const res = await fetch('/api/share', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-
-      const json = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(json?.error ?? 'Share API failed')
-
-      const shareId = json.share_id ?? json.id
-      if (!shareId) throw new Error('Share API returned no share_id')
-
-      const link = `${window.location.origin}/share/${shareId}`
-
-      try {
-        await navigator.clipboard.writeText(link)
-        setStatus('Share link copied ✅')
-      } catch {
-        window.prompt('Copy this share link:', link)
-        setStatus('Share link ready ✅')
-      }
-    } catch (e) {
-      setError({ message: e?.message ?? String(e) })
-      setStatus('Share link failed ❌')
-    } finally {
-      setShareBusy(false)
-    }
+        {p.notes && (
+          <div style={{ marginTop: 10 }}>
+            <b>Notes:</b> {p.notes}
+          </div>
+        )}
+      </div>
+    )
   }
 
   return (
@@ -374,7 +327,7 @@ export default function Home() {
             fontWeight: mode === 'theology' ? 800 : 500,
           }}
         >
-          Theology Mode
+          Theology Mode (Plans)
         </button>
       </div>
 
@@ -382,7 +335,7 @@ export default function Home() {
         <section style={{ marginTop: 16 }}>
           <h2 style={{ margin: 0 }}>Describe what you’re facing</h2>
           <p style={{ marginTop: 6, opacity: 0.8 }}>
-            We map your input to a theme, then return the most relevant passages.
+            We map your input to a theme, pull candidates, then curate along a Christ-centered arc.
           </p>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
@@ -395,15 +348,15 @@ export default function Home() {
 
             <button
               onClick={runSituationSearch}
-              disabled={loadingThemes || loadingPassages || !situationText.trim()}
+              disabled={loadingThemes || loading || !situationText.trim()}
               style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
             >
-              {loadingPassages ? 'Loading…' : 'Get passages'}
+              {loading ? 'Loading…' : 'Get passages'}
             </button>
 
             <button
               onClick={resetSituation}
-              disabled={loadingPassages}
+              disabled={loading}
               style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
             >
               Reset
@@ -432,35 +385,58 @@ export default function Home() {
                 .join(', ')}
             </div>
           )}
+
+          <div style={{ display: 'grid', gap: 18, marginTop: 16 }}>
+            {(() => {
+              const grouped = groupByArc(passages)
+              const arcsToShow = ARC_ORDER.filter((arc) => (grouped[arc] ?? []).length > 0)
+              if (arcsToShow.length === 0) return null
+
+              return arcsToShow.map((arc) => (
+                <section key={arc} style={{ display: 'grid', gap: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+                    <h2 style={{ margin: 0, fontSize: 16 }}>{ARC_LABELS[arc] ?? arc}</h2>
+                    <span style={{ opacity: 0.7, fontSize: 12 }}>{(grouped[arc] ?? []).length}</span>
+                  </div>
+
+                  <div style={{ display: 'grid', gap: 12 }}>
+                    {(grouped[arc] ?? []).map((p) => (
+                      <PassageCard key={p.id ?? `${p.ref}-${p.esv_url}`} p={p} />
+                    ))}
+                  </div>
+                </section>
+              ))
+            })()}
+          </div>
         </section>
       )}
 
       {mode === 'theology' && (
         <section style={{ marginTop: 16 }}>
-          <h2 style={{ margin: 0 }}>Ask a theology question</h2>
+          <h2 style={{ margin: 0 }}>Ask a theological question</h2>
           <p style={{ marginTop: 6, opacity: 0.8 }}>
-            Ask a doctrinal or Bible teaching question and get relevant passages.
+            We generate a study plan, retrieve passages, then curate for: God, humanity/sin, Christ, apostolic teaching, gospel.
           </p>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
             <input
-              value={theologyText}
-              onChange={(e) => setTheologyText(e.target.value)}
-              placeholder="Example: What does the Bible say about salvation?"
+              value={theologyQuestion}
+              onChange={(e) => setTheologyQuestion(e.target.value)}
+              placeholder="Example: What is justification?"
               style={{ padding: 10, borderRadius: 10, border: '1px solid #ddd', minWidth: 320 }}
             />
 
             <button
-              onClick={runTheologySearch}
-              disabled={loadingPassages || !theologyText.trim()}
+              onClick={runTheology}
+              disabled={loading || !theologyQuestion.trim()}
               style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
             >
-              {loadingPassages ? 'Loading…' : 'Get theology passages'}
+              {loading ? 'Loading…' : 'Generate plan'}
             </button>
 
             <button
               onClick={resetTheology}
-              disabled={loadingPassages}
+              disabled={loading}
               style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
             >
               Reset
@@ -471,12 +447,64 @@ export default function Home() {
             {quickTheology.map((q) => (
               <button
                 key={q}
-                onClick={() => setTheologyText(q)}
+                onClick={() => setTheologyQuestion(q)}
                 style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd' }}
               >
                 {q}
               </button>
             ))}
+          </div>
+
+          {theologyTopic ? (
+            <div style={{ marginTop: 12, opacity: 0.9 }}>
+              <b>Topic:</b> {theologyTopic}
+            </div>
+          ) : null}
+
+          <div style={{ display: 'grid', gap: 18, marginTop: 16 }}>
+            {(theologySteps ?? [])
+              .filter((step) => (step.passages ?? []).length > 0) // ✅ hide empty steps
+              .map((step, idx) => {
+                const grouped = groupByArc(step.passages ?? [])
+                const arcsToShow = ARC_ORDER.filter((arc) => (grouped[arc] ?? []).length > 0)
+
+                if (arcsToShow.length === 0) return null // ✅ safety
+
+                const count = (step.passages ?? []).length
+
+                return (
+                  <section
+                    key={`${step.step_title}-${idx}`}
+                    style={{ border: '1px solid #ddd', borderRadius: 12, padding: 16 }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12 }}>
+                      <div>
+                        <div style={{ fontWeight: 900, fontSize: 16 }}>{step.step_title ?? `Step ${idx + 1}`}</div>
+                        {step.step_goal ? <div style={{ marginTop: 6, opacity: 0.85 }}>{step.step_goal}</div> : null}
+                      </div>
+
+                      <div style={{ opacity: 0.7, fontSize: 12 }}>{count} passages</div>
+                    </div>
+
+                    <div style={{ display: 'grid', gap: 18, marginTop: 14 }}>
+                      {arcsToShow.map((arc) => (
+                        <div key={`${idx}-${arc}`} style={{ display: 'grid', gap: 10 }}>
+                          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+                            <h3 style={{ margin: 0, fontSize: 14 }}>{ARC_LABELS[arc] ?? arc}</h3>
+                            <span style={{ opacity: 0.65, fontSize: 12 }}>{(grouped[arc] ?? []).length}</span>
+                          </div>
+
+                          <div style={{ display: 'grid', gap: 12 }}>
+                            {(grouped[arc] ?? []).map((p) => (
+                              <PassageCard key={p.id ?? `${p.ref}-${p.esv_url}`} p={p} />
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )
+              })}
           </div>
         </section>
       )}
@@ -492,75 +520,6 @@ export default function Home() {
           {JSON.stringify(error, null, 2)}
         </pre>
       )}
-
-      {passages.length > 0 && (
-        <section style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          <button
-            onClick={copyToClipboard}
-            style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
-          >
-            Copy
-          </button>
-
-          <button
-            onClick={downloadTxt}
-            style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
-          >
-            Download .txt
-          </button>
-
-          <button
-            onClick={shareNative}
-            style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
-          >
-            Share…
-          </button>
-
-          <button
-            onClick={copyShareLink}
-            disabled={shareBusy}
-            style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #ddd' }}
-            title="Creates a shareable link via /api/share"
-          >
-            {shareBusy ? 'Creating link…' : 'Copy share link'}
-          </button>
-
-          <span style={{ opacity: 0.7, alignSelf: 'center' }}>
-            Exports your input + selected passages.
-          </span>
-        </section>
-      )}
-
-      <div style={{ display: 'grid', gap: 12, marginTop: 16 }}>
-        {passages.map((p) => (
-          <div key={p.id ?? `${p.ref}-${p.esv_url}`} style={{ border: '1px solid #ddd', borderRadius: 12, padding: 16 }}>
-            <div style={{ fontWeight: 800, fontSize: 16 }}>{p.ref}</div>
-
-            <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>
-              {(p.genre ?? '—')} • {(p.unit ?? '—')} • {(p.ref_key ?? '—')}
-              {typeof p.similarity === 'number' ? ` • sim: ${p.similarity.toFixed(3)}` : ''}
-              {(p.arc_label ?? p.arc ?? p.role) ? ` • arc: ${p.arc_label ?? p.arc ?? p.role}` : ''}
-              {(p.step_label ?? p.step) ? ` • step: ${p.step_label ?? p.step}` : ''}
-            </div>
-
-            <div style={{ marginTop: 10 }}>
-              {p.esv_url ? (
-                <a href={p.esv_url} target="_blank" rel="noreferrer" style={{ textDecoration: 'underline' }}>
-                  Open in ESV
-                </a>
-              ) : (
-                <em>(No link)</em>
-              )}
-            </div>
-
-            {p.notes && (
-              <div style={{ marginTop: 10 }}>
-                <b>Notes:</b> {p.notes}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
     </main>
   )
 }

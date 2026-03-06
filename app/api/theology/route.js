@@ -21,13 +21,12 @@ async function embedText(input) {
   return resp.data[0].embedding
 }
 
-async function semanticSearch(themeId, input, matchCount = 20) {
+async function semanticSearch(input, matchCount = 20) {
   const embedding = await embedText(input)
 
   const { data, error } = await supabase.rpc('match_passages', {
     query_embedding: embedding,
     match_count: matchCount,
-    filter_theme_id: themeId ?? null,
   })
 
   if (error) {
@@ -184,7 +183,7 @@ Schema:
           ? step.search_queries.join(' | ')
           : `${topic} ${step.step_title} ${step.step_goal}`
 
-      const candidates = await semanticSearch(null, queryText, 20)
+     const candidates = await semanticSearch(queryText, 20)
 
       const curated = await curatePassages(question, candidates, {
         mode: 'theology',
